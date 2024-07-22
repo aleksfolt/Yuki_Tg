@@ -1,199 +1,437 @@
 import importlib
+import re
 import sys
 import time
 from datetime import timedelta
+import aiohttp
+import aiofiles
 import requests
 from pyrogram import Client, filters
 import os
+import json
+import logging
+import asyncio
+import psutil
+import platform
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 start_time = time.time()
-file_name = "Yuki.bot"
-
-if not os.path.exists("modules.bot"):
-    with open("modules.bot", "w") as file:
-        pass
-
-if not os.path.exists(file_name):
-    api_id = input("Введите API ID: ")
-    api_hash = input("Введите API Hash: ")
-    prefix = input("Введите префикс который будет использоваться для команд, пример: !help или .help: ")
-    user_id = input("Введите ваш user id (программа будет работать только с тем человеком чей id вы указали):")
-
-    with open(file_name, 'w') as file:
-        file.write(f"api_id={api_id}\n")
-        file.write(f"api_hash={api_hash}\n")
-        file.write(f"prefix={prefix}\n")
-        file.write(f"user_id={user_id}\n")
-
-    app = Client("telery_userbot", api_id=api_id, api_hash=api_hash)
-    yuki_prefix = prefix
-    OWNER_ID = int(user_id)
-else:
-    with open(file_name, 'r') as file:
-        data = {}
-        for line in file:
-            key, value = line.strip().split('=')
-            data[key] = value
-    app = Client("telery_userbot", api_id=data['api_id'], api_hash=data['api_hash'])
-    yuki_prefix = data['prefix']
-    OWNER_ID = int(data['user_id'])
+config_file = "config.json"
+modules_file = "modules.json"
 
 
-def is_owner(_, __, message):
-    return message.from_user.id == OWNER_ID
+async def read_json(file_name):
+    async with aiofiles.open(file_name, mode='r') as file:
+        content = await file.read()
+    return json.loads(content)
 
 
-def load_modules():
+async def write_json(file_name, data):
+    async with aiofiles.open(file_name, mode='w') as file:
+        await file.write(json.dumps(data, indent=4))
+
+
+async def init_bot():
+    if not os.path.exists(modules_file):
+        async with aiofiles.open(modules_file, 'w') as file:
+            await file.write(json.dumps([], indent=4))
+
+    if not os.path.exists(config_file):
+        api_id = input("Enter API ID: ")
+        api_hash = input("Enter API Hash: ")
+        prefix = input("Enter the prefix for commands (e.g., !help or .help): ")
+
+        config_data = {"api_id": api_id, "api_hash": api_hash, "prefix": prefix}
+        await write_json(config_file, config_data)
+    else:
+        config_data = await read_json(config_file)
+
+    app = Client("yuki_userbot", api_id=config_data['api_id'], api_hash=config_data['api_hash'])
+    return app, config_data['prefix']
+
+
+async def load_modules():
     modules = []
-    with open("modules.bot", "r") as file:
-        for line in file:
-            module_name = line.strip()
+    damaged_modules = []
+    modules_list = await read_json(modules_file)
+    for module_name in modules_list:
+        try:
             module = importlib.import_module(module_name)
             modules.append(module)
-    return modules
+        except Exception as e:
+            damaged_modules.append((module_name, str(e)))
+    return modules, damaged_modules
 
 
-@app.on_message(filters.create(is_owner) & filters.command("help", prefixes=yuki_prefix))
-async def help_command(_, message):
-    modules = load_modules()
-    help_text = "**Модулей загружено: {}**\n".format(len(modules))
-    for module in modules:
-        help_text += f"{module.cinfo} - {module.ccomand}\n"
-    help_text += (f"**Стандартные команды:**\n"
-                  f"ℹ`{yuki_prefix}info` - инфо о юзерботе\n"
-                  f"⌛`{yuki_prefix}ping` - Пишет пинг юб.\n"
-                  f"💤`{yuki_prefix}off` - Отключает юзербота.\n"
-                  f"🔄`{yuki_prefix}restart` - Перезагрузка юзербота\n"
-                  f"🔽`{yuki_prefix}dm` - `{yuki_prefix}dm` <ссылка на загрузку файла>. Установка модуля на Yuki.\n"
-                  f"🗑`{yuki_prefix}`delm = ``{yuki_prefix}`delm` <имя модуля>. Удаление модуля из Yuki.")
-    await message.reply_text(help_text)
+RISK_METHODS = {
+    "critical": [
+        "DeleteAccountRequest", "ResetAuthorizationRequest", "GetAuthorizationsRequest",
+        "DeleteAccount", "ResetAuthorization", "GetAuthorizations"
+    ],
+    "warn": [
+        "log_out", "LogOut"
+    ],
+    "not_bad": [
+        "torpy", "pyarmor"
+    ]
+}
 
 
-@app.on_message(filters.create(is_owner) & filters.command("info", prefixes=yuki_prefix))
-async def info_command(_, message):
-    current_time = time.time()
-    uptime_seconds = int(round(current_time - start_time))
-    uptime = str(timedelta(seconds=uptime_seconds))
-    ping_start_time = time.time()
-    await message.delete()
-    ping_end_time = time.time()
-    ping_time = round((ping_end_time - ping_start_time) * 1000, 1)
-    user = message.from_user
-    user_last = user.last_name if user.last_name else ""
-    username = f"[{user.first_name} {user_last}](https://t.me/{user.username})"
-    await app.send_photo(
-        chat_id=message.chat.id,
-        photo="https://github.com/user-attachments/assets/aecc7f9e-98b8-449e-83f2-74c3ab412df9",
-        caption=f"**❄️ 雪 Yuki**\n"
-                f"__🔧Version: 1.1__\n"
-                f"Source: @YukiTgUserBot\n"
-                f"**Ping: {ping_time}ms**\n"
-                f"**Uptime: {uptime}**\n"
-                f"User: {username}"
-    )
+def check_code_for_risk_methods(code):
+    found_methods = {"critical": [], "warn": [], "not_bad": []}
+    for risk, methods in RISK_METHODS.items():
+        for method in methods:
+            if re.search(r'\b' + re.escape(method) + r'\b', code):
+                found_methods[risk].append(method)
+    return found_methods
 
 
-@app.on_message(filters.create(is_owner) & filters.command(["ping"], prefixes=yuki_prefix))
-async def ping(_, message):
-    ping_start_time = time.time()
-    msg = await message.edit("🌕")
-    ping_end_time = time.time()
-    ping_time = round((ping_end_time - ping_start_time) * 1000)
-    uptime_seconds = int(round(time.time() - start_time))
-    uptime = str(timedelta(seconds=uptime_seconds))
-    await msg.edit(f"**🕛Ваш пинг: {ping_time} мс**\n**Uptime: {uptime}**")
+async def help_command(app, yuki_prefix):
+    @app.on_message(filters.me & filters.command("help", prefixes=yuki_prefix))
+    async def _help_command(_, message):
+        try:
+            modules, damaged_modules = await load_modules()
+            help_text = "**❄️ Yuki Userbot Commands ❄️**\n\n"
+            help_text += f"**Modules loaded: {len(modules)}**\n"
+            for module in modules:
+                module_name = module.__name__.split('.')[-1]
+                help_text += f"📦 **{module_name}**\n"
+                help_text += f"ℹ️ Description: {module.ccomand}\n"
+                help_text += f"🛠 Command: {module.cinfo}\n\n"
+
+            if damaged_modules:
+                help_text += "**Damaged modules:**\n"
+                for module_name, error in damaged_modules:
+                    help_text += f"❗ **{module_name}**\n"
+                    help_text += f"Error: {error}\n\n"
+
+            help_text += "**Standard commands:**\n"
+            help_text += f"ℹ️ {yuki_prefix}info - Bot information\n"
+            help_text += f"⌛ {yuki_prefix}ping - Show bot ping\n"
+            help_text += f"💤 {yuki_prefix}off - Turn off the bot\n"
+            help_text += f"🔄 {yuki_prefix}restart - Restart the bot\n"
+            help_text += f"🔽 {yuki_prefix}dm - `{yuki_prefix}dm` link - Download module from link\n"
+            help_text += f"🗑 {yuki_prefix}delm - `{yuki_prefix}delm` module name - Delete module\n"
+            help_text += f"📤 {yuki_prefix}unm - `{yuki_prefix}unm` module name - Send module file in chat\n"
+            help_text += f"📁 {yuki_prefix}lm - Reply `{yuki_prefix}lm` to the file. Installing a module from a file.\n"
+            help_text += f"✅ {yuki_prefix}check - Reply `{yuki_prefix}check`to the file check the file for bad practices"
+
+            await message.edit(help_text)
+        except Exception as e:
+            await message.reply_text(f"An error occurred while executing the help command: {str(e)}")
 
 
-@app.on_message(filters.create(is_owner) & filters.command("dm", prefixes=yuki_prefix))
-async def download_py_file(_, message):
-    if len(message.command) < 2:
-        await message.reply_text("❗Пожалуйста, укажите ссылку на файл.")
-        return
+def get_system_info():
+    ram = psutil.virtual_memory()
+    ram_total = ram.total / (1024 ** 3)
+    ram_used = ram.used / (1024 ** 3)
+    ram_percent = ram.percent
 
-    url = message.command[1]
-    if not url.endswith(".py"):
-        await message.reply_text("❗Файл не является Python скриптом (.py).")
-        return
+    system = platform.system()
+    release = platform.release()
+    version = platform.version()
 
-    try:
-        response = requests.get(url)
-        response.raise_for_status()
-        file_name = os.path.basename(url)
-        module_name = file_name[:-3]
+    return ram_total, ram_used, ram_percent, system, release, version
 
-        if os.path.exists("modules.bot"):
-            with open("modules.bot", "r") as modules_file:
-                existing_modules = modules_file.read().splitlines()
-                if module_name in existing_modules:
-                    await message.delete()
-                    await message.reply_text(f"❗Модуль `{module_name}` уже существует в `modules.bot`.")
+
+async def info_command(app, yuki_prefix):
+    @app.on_message(filters.me & filters.command("info", prefixes=yuki_prefix))
+    async def _info_command(_, message):
+        try:
+            current_time = time.time()
+            uptime_seconds = int(round(current_time - start_time))
+            uptime = str(timedelta(seconds=uptime_seconds))
+            ping_start_time = time.time()
+            await message.delete()
+            ping_end_time = time.time()
+            ping_time = round((ping_end_time - ping_start_time) * 1000, 1)
+            user = message.from_user
+            user_last = user.last_name if user.last_name else ""
+            username = f"[{user.first_name} {user_last}](https://t.me/{user.username})"
+            ram_total, ram_used, ram_percent, system, release, version = get_system_info()
+            await app.send_message(
+                chat_id=message.chat.id,
+                text=f"**❄️ 雪 Yuki**\n"
+                     f"__🔧Version: 1.2__\n\n"
+                     f"{username}@yuki-userbot\n"
+                     f"      **Uptime:** {uptime}\n"
+                     f"      **RAM:** {ram_used:.2f} GB / {ram_total:.2f} GB ({ram_percent}%)\n"
+                     f"      **OS:** {system} {release}\n"
+                     f"      **Ping:** {ping_time}ms\n"
+                , disable_web_page_preview=True)
+        except Exception as e:
+            await message.reply_text(f"An error occurred while executing the info command: {str(e)}")
+
+
+async def ping_command(app, yuki_prefix):
+    @app.on_message(filters.me & filters.command("ping", prefixes=yuki_prefix))
+    async def _ping_command(_, message):
+        try:
+            ping_start_time = time.time()
+            msg = await message.edit("❄️")
+            ping_end_time = time.time()
+            ping_time = round((ping_end_time - ping_start_time) * 1000)
+            uptime_seconds = int(round(time.time() - start_time))
+            uptime = str(timedelta(seconds=uptime_seconds))
+            await msg.edit(f"**🕛 Your ping: {ping_time} ms**\n**⏳ Uptime: {uptime}**")
+        except Exception as e:
+            await message.reply_text(f"An error occurred while executing the ping command: {str(e)}")
+
+
+async def check_file(app, yuki_prefix):
+    @app.on_message(filters.me & filters.command("check", prefixes=yuki_prefix))
+    async def check_dangerous_methods(client: Client, message):
+        try:
+            file_path = ""
+            if message.reply_to_message and message.reply_to_message.document:
+                if message.reply_to_message.document.mime_type == "text/x-python":
+                    filename = message.reply_to_message.document.file_name
+                    file_path = os.path.join(os.getcwd(), filename)
+                    await client.download_media(message.reply_to_message.document.file_id, file_path)
+                else:
+                    await message.edit("❌ Please ensure this is a Python file.")
+                    return
+            elif message.text:
+                url = message.text.split(maxsplit=1)[1].strip()
+                response = requests.get(url)
+                if response.status_code == 200:
+                    filename = url.split('/')[-1]
+                    file_path = os.path.join(os.getcwd(), filename)
+                    with open(file_path, 'wb') as file:
+                        file.write(response.content)
+                else:
+                    await message.edit("❌ Failed to retrieve the file from the URL.")
+                    return
+            elif message.document:
+                if message.document.mime_type == "text/x-python":
+                    filename = message.document.file_name
+                    file_path = os.path.join(os.getcwd(), filename)
+                    await client.download_media(message.document.file_id, file_path)
+                else:
+                    await message.edit("❌ Please send a Python file.")
                     return
 
-        with open(file_name, "wb") as file:
-            file.write(response.content)
+            if file_path:
+                with open(file_path, 'r', encoding='utf-8') as file:
+                    content = file.read()
 
-        with open("modules.bot", "a") as modules_file:
-            modules_file.write(f"{module_name}\n")
+                found_methods = check_code_for_risk_methods(content)
+                response_text = ""
+                for risk_level, methods in found_methods.items():
+                    if methods:
+                        response_text += f"⚠️ {risk_level.capitalize()}: {' '.join(methods)}\n"
+                if response_text:
+                    await message.reply_text(response_text)
+                else:
+                    await message.edit("✅ No dangerous methods found in the file.")
+            else:
+                await message.edit("❌ Error occurred during file processing.")
 
-        await message.delete()
-        await message.reply_text(f"✅ Файл `{file_name}` успешно загружен и сохранен.\n\nLink: `{url}`")
+        except Exception as e:
+            await message.edit(f"❌ Error occurred: {str(e)}")
+
+
+async def dm_command(app, yuki_prefix):
+    @app.on_message(filters.me & filters.command("dm", prefixes=yuki_prefix))
+    async def _dm_command(_, message):
+        try:
+            if len(message.command) < 2:
+                await message.edit("❗Please provide a link to the file or module name.")
+                return
+
+            url = message.command[1]
+            if not url.startswith("http"):
+                url = f"https://raw.githubusercontent.com/aleksfolt/Yuki_Modules/main/{url}.py"
+
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url) as response:
+                        if response.status == 404:
+                            await message.edit(f"❌ Module `{url}` not found in the repository.")
+                            return
+                        response.raise_for_status()
+                        file_name = os.path.basename(url)
+                        module_name = file_name[:-3]
+
+                        modules_list = await read_json(modules_file)
+                        if module_name in modules_list:
+                            await message.edit(f"❗Module `{module_name}` already exists in `{modules_file}`.")
+                            return
+
+                        async with aiofiles.open(file_name, 'wb') as file:
+                            await file.write(await response.read())
+
+                        modules_list.append(module_name)
+                        await write_json(modules_file, modules_list)
+
+                        await message.delete()
+                        await message.reply_text(
+                            f"✅ File `{file_name}` successfully downloaded and saved.\n\nLink: `{url}`")
+                        os.execv(sys.executable, [sys.executable] + sys.argv)
+            except aiohttp.ClientError as e:
+                await message.reply_text(f"Error downloading file: {str(e)}")
+        except Exception as e:
+            await message.reply_text(f"An error occurred while executing the dm command: {str(e)}")
+
+
+async def load_module(app: Client, yuki_prefix):
+    @app.on_message(filters.me & filters.command("lm", prefixes=yuki_prefix))
+    async def load_cmd(_, message):
+        reply = message.reply_to_message
+        file = message if message.document else reply if reply and reply.document else None
+
+        if not file:
+            await message.edit("❌ A reply or a document is needed!")
+            return
+
+        if not file.document.file_name.endswith(".py"):
+            await message.edit("❌ Only .py files are supported!")
+            return
+
+        filename = file.document.file_name
+        module_name = filename.split(".py")[0]
+
+        await message.edit(f"❄️ Loading module **{module_name}**...")
+
+        file_path = os.path.join(os.getcwd(), filename)
+        await file.download(file_path)
+
+        modules_list = await read_json(modules_file)
+        if module_name not in modules_list:
+            modules_list.append(module_name)
+        await write_json(modules_file, modules_list)
+
+        await message.edit(f"❄️ Module **{module_name}** successfully loaded!")
         os.execv(sys.executable, [sys.executable] + sys.argv)
-    except requests.RequestException as e:
-        await message.reply_text(f"Ошибка при скачивании файла: {str(e)}")
 
 
-@app.on_message(filters.create(is_owner) & filters.command("delm", prefixes=yuki_prefix))
-async def delete_module(_, message):
-    if len(message.command) < 2:
-        await message.reply_text("❗Пожалуйста, укажите имя модуля для удаления.")
-        return
+async def delm_command(app, yuki_prefix):
+    @app.on_message(filters.me & filters.command("delm", prefixes=yuki_prefix))
+    async def _delm_command(_, message):
+        try:
+            if len(message.command) < 2:
+                await message.edit("❗Please provide the module name to delete.")
+                return
 
-    module_name = message.command[1]
-    module_file = f"{module_name}.py"
+            module_name = message.command[1]
+            module_file = f"{module_name}.py"
 
-    if not os.path.exists("modules.bot"):
-        await message.reply_text("❗Файл `modules.bot` не найден.")
-        return
+            modules_list = await read_json(modules_file)
+            if module_name not in modules_list:
+                await message.edit(f"❗Module `{module_name}` not found in `{modules_file}`.")
+                return
 
-    with open("modules.bot", "r") as modules_file:
-        existing_modules = modules_file.read().splitlines()
+            modules_list.remove(module_name)
+            await write_json(modules_file, modules_list)
 
-    if module_name not in existing_modules:
-        await message.reply_text(f"❗Модуль `{module_name}` не найден в `modules.bot`.")
-        return
+            if os.path.exists(module_file):
+                os.remove(module_file)
+                await message.edit(
+                    f"✅ Module `{module_name}` successfully deleted from `{modules_file}` and file `{module_file}` deleted.")
+            else:
+                await message.edit(
+                    f"✅ Module `{module_name}` successfully deleted from `{modules_file}`, but file `{module_file}` not found.")
 
-    updated_modules = [mod for mod in existing_modules if mod != module_name]
-
-    with open("modules.bot", "w") as modules_file:
-        modules_file.write("\n".join(updated_modules) + "\n")
-
-    if os.path.exists(module_file):
-        os.remove(module_file)
-        await message.reply_text(f"✅ Модуль `{module_name}` успешно удален из `modules.bot` и файл `{module_file}` удален.")
-    else:
-        await message.reply_text(f"✅ Модуль `{module_name}` успешно удален из `modules.bot`, но файл `{module_file}` не найден.")
-
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception as e:
+            await message.reply_text(f"An error occurred while executing the delm command: {str(e)}")
 
 
-@app.on_message(filters.create(is_owner) & filters.command(["off"], prefixes=yuki_prefix))
-def turn_off(_, message):
-    message.edit("**💤Отключаю юзербота...**")
-    exit()
+async def off_command(app, yuki_prefix):
+    @app.on_message(filters.me & filters.command("off", prefixes=yuki_prefix))
+    async def _off_command(_, message):
+        try:
+            await message.edit("**💤 Turning off the userbot...**")
+            await app.stop()
+        except Exception as e:
+            await message.reply_text(f"An error occurred while executing the off command: {str(e)}")
 
 
-@app.on_message(filters.create(is_owner) & filters.command(["restart"], prefixes=yuki_prefix))
-def turn_off(_, message):
-    message.edit("**🔄Перезагружаю юзербота...**")
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+async def restart_command(app, yuki_prefix):
+    @app.on_message(filters.me & filters.command("restart", prefixes=yuki_prefix))
+    async def _restart_command(_, message):
+        try:
+            await message.edit("**🔄 You Yuki well be rebooted...**")
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception as e:
+            await message.reply_text(f"An error occurred while executing the restart command: {str(e)}")
 
 
-def load_and_exec_modules():
-    modules = load_modules()
-    for module in modules:
-        if hasattr(module, 'register_module'):
-            module.register_module(app)
+async def unm_command(app, yuki_prefix):
+    @app.on_message(filters.me & filters.command("unm", prefixes=yuki_prefix))
+    async def _unm_command(_, message):
+        try:
+            if len(message.command) < 2:
+                await message.edit("❗Please provide the module name to send.")
+                return
+
+            module_name = message.command[1]
+            module_file = f"{module_name}.py"
+
+            if not os.path.exists(module_file):
+                await message.edit(f"❗File `{module_file}` not found.")
+                return
+            await app.send_document(message.chat.id, module_file)
+            await message.delete()
+        except Exception as e:
+            await message.reply_text(f"An error occurred while executing the unm command: {str(e)}")
 
 
-load_and_exec_modules()
-app.run()
+async def addprefix_command(app, yuki_prefix):
+    @app.on_message(filters.me & filters.command("addprefix", prefixes=yuki_prefix))
+    async def _addprefix_command(_, message):
+        try:
+            if len(message.command) < 2:
+                await message.edit("❗Please provide the new prefix.")
+                return
+
+            new_prefix = message.command[1]
+
+            config_data = await read_json(config_file)
+            config_data['prefix'] = new_prefix
+            await write_json(config_file, config_data)
+
+            global yuki_prefix
+            yuki_prefix = new_prefix
+
+            await message.reply_text(f"✅ Prefix successfully changed to `{new_prefix}`.")
+            await message.delete()
+        except Exception as e:
+            await message.reply_text(f"An error occurred while executing the addprefix command: {str(e)}")
+
+
+async def load_and_exec_modules(app):
+    try:
+        modules, _ = await load_modules()
+        for module in modules:
+            if hasattr(module, 'register_module'):
+                module.register_module(app)
+    except Exception as e:
+        logger.error(f"An error occurred while loading modules: {str(e)}")
+
+
+def main():
+    loop = asyncio.get_event_loop()
+    app, yuki_prefix = loop.run_until_complete(init_bot())
+
+    loop.run_until_complete(load_and_exec_modules(app))
+    loop.run_until_complete(help_command(app, yuki_prefix))
+    loop.run_until_complete(info_command(app, yuki_prefix))
+    loop.run_until_complete(ping_command(app, yuki_prefix))
+    loop.run_until_complete(dm_command(app, yuki_prefix))
+    loop.run_until_complete(delm_command(app, yuki_prefix))
+    loop.run_until_complete(off_command(app, yuki_prefix))
+    loop.run_until_complete(restart_command(app, yuki_prefix))
+    loop.run_until_complete(unm_command(app, yuki_prefix))
+    loop.run_until_complete(addprefix_command(app, yuki_prefix))
+    loop.run_until_complete(load_module(app, yuki_prefix))
+    loop.run_until_complete(check_file(app, yuki_prefix))
+
+    app.run()
+
+
+if __name__ == "__main__":
+    main()
+
